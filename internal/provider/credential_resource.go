@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -16,6 +17,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/tines/go-sdk/tines"
@@ -27,18 +29,20 @@ type credentialResource struct {
 }
 
 type credentialResourceModel struct {
-	Id          types.Int64  `tfsdk:"id"`
-	Name        types.String `tfsdk:"name"`
-	Mode        types.String `tfsdk:"mode"`
-	Value       types.String `tfsdk:"value"`
-	TeamId      types.Int64  `tfsdk:"team_id"`
-	FolderId    types.Int64  `tfsdk:"folder_id"`
-	Description types.String `tfsdk:"description"`
-	ReadAccess  types.String `tfsdk:"read_access"`
-	SharedTeams types.List   `tfsdk:"shared_team_slugs"`
-	Slug        types.String `tfsdk:"slug"`
-	CreatedAt   types.String `tfsdk:"created_at"`
-	UpdatedAt   types.String `tfsdk:"updated_at"`
+	Id             types.Int64  `tfsdk:"id"`
+	Name           types.String `tfsdk:"name"`
+	Mode           types.String `tfsdk:"mode"`
+	Value          types.String `tfsdk:"value"`
+	ValueWo        types.String `tfsdk:"value_wo"`
+	ValueWoVersion types.Int64  `tfsdk:"value_wo_version"`
+	TeamId         types.Int64  `tfsdk:"team_id"`
+	FolderId       types.Int64  `tfsdk:"folder_id"`
+	Description    types.String `tfsdk:"description"`
+	ReadAccess     types.String `tfsdk:"read_access"`
+	SharedTeams    types.List   `tfsdk:"shared_team_slugs"`
+	Slug           types.String `tfsdk:"slug"`
+	CreatedAt      types.String `tfsdk:"created_at"`
+	UpdatedAt      types.String `tfsdk:"updated_at"`
 }
 
 // Ensure the implementation satisfies the expected interfaces.
@@ -94,9 +98,40 @@ func (r *credentialResource) Schema(ctx context.Context, _ resource.SchemaReques
 				},
 			},
 			"value": schema.StringAttribute{
-				Description: "The secret value of the Tines Credential. This is write-only; the Tines API never returns it, so changes are detected from configuration. Rotate a secret by updating this value.",
-				Required:    true,
-				Sensitive:   true,
+				Description: "The secret value of the Tines Credential. The Tines API never returns this value, so it cannot be " +
+					"populated on import and drift is detected from configuration only. This attribute is stored in Terraform " +
+					"state (marked sensitive); for secrets that must never be persisted to state, use `value_wo` instead. " +
+					"Exactly one of `value` or `value_wo` must be set. Rotate a secret by updating this value.",
+				Optional:  true,
+				Sensitive: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+					stringvalidator.ExactlyOneOf(
+						path.MatchRoot("value"),
+						path.MatchRoot("value_wo"),
+					),
+				},
+			},
+			"value_wo": schema.StringAttribute{
+				Description: "The secret value of the Tines Credential, supplied as a write-only argument so that it is never " +
+					"persisted to Terraform state (requires Terraform >= 1.11). Because write-only values are not stored, " +
+					"changes are not detected automatically: bump `value_wo_version` to signal that the secret should be " +
+					"rewritten to Tines (e.g. during secret rotation). Exactly one of `value` or `value_wo` must be set.",
+				Optional:  true,
+				Sensitive: true,
+				WriteOnly: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
+			},
+			"value_wo_version": schema.Int64Attribute{
+				Description: "A user-managed version counter for `value_wo`. Increment this whenever the write-only secret " +
+					"changes so that Terraform triggers an in-place update (secret rotation). Has no effect unless " +
+					"`value_wo` is set.",
+				Optional: true,
+				Validators: []validator.Int64{
+					int64validator.AlsoRequires(path.MatchRoot("value_wo")),
+				},
 			},
 			"team_id": schema.Int64Attribute{
 				Description: "The ID of the Tines Team where this Tines Credential will be located.",
@@ -168,13 +203,21 @@ func (r *credentialResource) Create(ctx context.Context, req resource.CreateRequ
 		return
 	}
 
+	// Write-only attributes are not present in the plan, so read the effective
+	// secret value from configuration.
+	secret, diags := r.resolveSecretValue(ctx, req.Config, &plan)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	newCred := tines.Credential{
 		Name:        plan.Name.ValueString(),
 		Mode:        tines.CredentialType(plan.Mode.ValueString()),
 		Description: plan.Description.ValueString(),
 		TeamId:      int(plan.TeamId.ValueInt64()),
 		CredentialPayload: tines.CredentialPayload{
-			TextValue: plan.Value.ValueString(),
+			TextValue: secret,
 		},
 	}
 
@@ -232,8 +275,19 @@ func (r *credentialResource) Read(ctx context.Context, req resource.ReadRequest,
 
 	remoteState, err := r.client.GetCredential(ctx, int(localState.Id.ValueInt64()))
 	if err != nil {
-		// Treat HTTP 404 Not Found status as a signal to recreate resource
+		// Treat HTTP 404 Not Found status as a signal to recreate the resource
 		// and return early.
+		//
+		// NOTE: as of go-sdk v0.2.2/v0.3.0 this branch cannot currently fire.
+		// GetCredential re-wraps the underlying request error in a fresh
+		// tines.Error without copying StatusCode (and the numeric code is not
+		// recoverable from the message string), so tinesErr.StatusCode is
+		// always 0 here. GetResource has the same limitation; GetStory returns
+		// the error unwrapped, which is why the identical pattern works for
+		// stories. The correct fix is in go-sdk (propagate StatusCode when
+		// wrapping, or return the error unwrapped like GetStory). The check is
+		// retained so that "recreate on 404" begins working automatically once
+		// the SDK is fixed, without a further change here. See PR #85 review.
 		if tinesErr, ok := err.(tines.Error); ok {
 			if tinesErr.StatusCode == 404 {
 				resp.State.RemoveResource(ctx)
@@ -246,6 +300,24 @@ func (r *credentialResource) Read(ctx context.Context, req resource.ReadRequest,
 			"An unexpected error occurred while attempting to refresh resource state. "+
 				"Please retry the operation or report this issue to the provider developers.\n\n"+
 				"HTTP Error: "+err.Error(),
+		)
+		return
+	}
+
+	// This resource only manages TEXT mode Credentials. If an existing
+	// Credential of another mode is imported (ImportState only sets the ID and
+	// cannot enforce the mode validator), refuse to reconcile it rather than
+	// writing a non-TEXT mode into state, which would otherwise cause the next
+	// plan to propose a destroy-and-recreate of a Credential this resource
+	// cannot recreate.
+	if remoteState.Mode != tines.CredentialTypeText {
+		resp.Diagnostics.AddError(
+			"Unsupported Tines Credential Mode",
+			fmt.Sprintf(
+				"Tines Credential %d has mode %q, but the tines_credential resource only supports %q mode "+
+					"Credentials. Managing or importing non-TEXT Credentials is not supported.",
+				remoteState.Id, remoteState.Mode, tines.CredentialTypeText,
+			),
 		)
 		return
 	}
@@ -281,12 +353,20 @@ func (r *credentialResource) Update(ctx context.Context, req resource.UpdateRequ
 		return
 	}
 
+	// Write-only attributes are not present in the plan, so read the effective
+	// secret value from configuration.
+	secret, diags := r.resolveSecretValue(ctx, req.Config, &plan)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	// The SDK requires both the Id and Mode to be set when updating a Credential.
 	credUpdate := tines.Credential{
 		Id:   int(state.Id.ValueInt64()),
 		Mode: tines.CredentialType(plan.Mode.ValueString()),
 		CredentialPayload: tines.CredentialPayload{
-			TextValue: plan.Value.ValueString(),
+			TextValue: secret,
 		},
 	}
 
@@ -394,9 +474,32 @@ func (r *credentialResource) Configure(_ context.Context, req resource.Configure
 	r.client = client
 }
 
+// resolveSecretValue returns the effective secret to send to the Tines API,
+// reading the write-only `value_wo` attribute from configuration when it is set
+// and otherwise falling back to the state-persisted `value` attribute. The
+// schema guarantees (via ExactlyOneOf) that exactly one of the two is supplied.
+func (r *credentialResource) resolveSecretValue(ctx context.Context, config tfsdk.Config, plan *credentialResourceModel) (string, diag.Diagnostics) {
+	var diags diag.Diagnostics
+
+	// Write-only attributes are never present in the plan or state; they can
+	// only be read from configuration.
+	var valueWo types.String
+	diags.Append(config.GetAttribute(ctx, path.Root("value_wo"), &valueWo)...)
+	if diags.HasError() {
+		return "", diags
+	}
+
+	if !valueWo.IsNull() && !valueWo.IsUnknown() {
+		return valueWo.ValueString(), diags
+	}
+
+	return plan.Value.ValueString(), diags
+}
+
 // convertCredentialToPlan maps API response values onto the Terraform plan. The
-// secret `value` attribute is intentionally not modified here because the Tines
-// API never returns it; the configured/state value is preserved instead.
+// secret `value`/`value_wo` attributes are intentionally not modified here
+// because the Tines API never returns the secret; the configured value (or, for
+// write-only, nothing) is preserved instead.
 func (r *credentialResource) convertCredentialToPlan(ctx context.Context, plan *credentialResourceModel, cred *tines.Credential) (diags diag.Diagnostics) {
 	plan.Id = types.Int64Value(int64(cred.Id))
 	plan.Name = types.StringValue(cred.Name)

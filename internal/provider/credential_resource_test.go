@@ -1,6 +1,9 @@
 package provider
 
 import (
+	"fmt"
+	"os"
+	"strconv"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -9,6 +12,19 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/statecheck"
 	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 )
+
+// testAccTeamID returns the Tines Team ID to use in acceptance tests. It can be
+// overridden with the TINES_TEST_TEAM_ID environment variable so the tests can
+// run against any tenant without hardcoding a team, and defaults to the value
+// used by the existing tines_resource acceptance tests.
+func testAccTeamID() int64 {
+	if v := os.Getenv("TINES_TEST_TEAM_ID"); v != "" {
+		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return id
+		}
+	}
+	return 30906
+}
 
 func TestAccTinesCredential_Text(t *testing.T) {
 	resource.Test(t, resource.TestCase{
@@ -27,7 +43,7 @@ func TestAccTinesCredential_Text(t *testing.T) {
 						plancheck.ExpectKnownValue(
 							"tines_credential.test_example_text",
 							tfjsonpath.New("team_id"),
-							knownvalue.Int64Exact(30906),
+							knownvalue.Int64Exact(testAccTeamID()),
 						),
 					},
 				},
@@ -80,21 +96,110 @@ func TestAccTinesCredential_Text(t *testing.T) {
 }
 
 func testAccCreateTinesCredentialText() string {
-	return `
+	return fmt.Sprintf(`
 resource "tines_credential" "test_example_text" {
-	team_id = 30906
+	team_id = %d
 	name = "Terraform Test Text Credential"
 	value = "initial_secret_value"
 }
-	`
+	`, testAccTeamID())
 }
 
 func testAccUpdateTinesCredentialText() string {
-	return `
+	return fmt.Sprintf(`
 resource "tines_credential" "test_example_text" {
-	team_id = 30906
+	team_id = %d
 	name = "Terraform Test Text Credential"
 	value = "rotated_secret_value"
 }
-	`
+	`, testAccTeamID())
+}
+
+func TestAccTinesCredential_WriteOnly(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// Create the Tines Credential using a write-only secret value.
+				Config: providerConfig + testAccCreateTinesCredentialWriteOnly(),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectNonEmptyPlan(),
+						plancheck.ExpectUnknownValue(
+							"tines_credential.test_example_wo",
+							tfjsonpath.New("id"),
+						),
+					},
+				},
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue(
+						"tines_credential.test_example_wo",
+						tfjsonpath.New("id"),
+						knownvalue.NotNull(),
+					),
+					statecheck.ExpectKnownValue(
+						"tines_credential.test_example_wo",
+						tfjsonpath.New("mode"),
+						knownvalue.StringExact("TEXT"),
+					),
+					// The write-only value must never be persisted to state.
+					statecheck.ExpectKnownValue(
+						"tines_credential.test_example_wo",
+						tfjsonpath.New("value_wo"),
+						knownvalue.Null(),
+					),
+					statecheck.ExpectKnownValue(
+						"tines_credential.test_example_wo",
+						tfjsonpath.New("value_wo_version"),
+						knownvalue.Int64Exact(1),
+					),
+				},
+			},
+			{
+				// Rotate the secret by bumping value_wo_version, which triggers
+				// an in-place update.
+				Config: providerConfig + testAccRotateTinesCredentialWriteOnly(),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectNonEmptyPlan(),
+						plancheck.ExpectResourceAction("tines_credential.test_example_wo", plancheck.ResourceActionUpdate),
+					},
+				},
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue(
+						"tines_credential.test_example_wo",
+						tfjsonpath.New("value_wo_version"),
+						knownvalue.Int64Exact(2),
+					),
+					statecheck.ExpectKnownValue(
+						"tines_credential.test_example_wo",
+						tfjsonpath.New("value_wo"),
+						knownvalue.Null(),
+					),
+				},
+			},
+		},
+	})
+}
+
+func testAccCreateTinesCredentialWriteOnly() string {
+	return fmt.Sprintf(`
+resource "tines_credential" "test_example_wo" {
+	team_id = %d
+	name = "Terraform Test Write-Only Credential"
+	value_wo = "initial_secret_value"
+	value_wo_version = 1
+}
+	`, testAccTeamID())
+}
+
+func testAccRotateTinesCredentialWriteOnly() string {
+	return fmt.Sprintf(`
+resource "tines_credential" "test_example_wo" {
+	team_id = %d
+	name = "Terraform Test Write-Only Credential"
+	value_wo = "rotated_secret_value"
+	value_wo_version = 2
+}
+	`, testAccTeamID())
 }
