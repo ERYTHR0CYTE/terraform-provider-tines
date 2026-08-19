@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/statecheck"
 	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
+	"github.com/hashicorp/terraform-plugin-testing/tfversion"
 )
 
 // testAccTeamID returns the Tines Team ID to use in acceptance tests. It can be
@@ -117,6 +118,11 @@ resource "tines_credential" "test_example_text" {
 
 func TestAccTinesCredential_WriteOnly(t *testing.T) {
 	resource.Test(t, resource.TestCase{
+		// Write-only attributes are only supported in Terraform 1.11 and later,
+		// so skip this test on the older versions covered by CI.
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.SkipBelow(tfversion.Version1_11_0),
+		},
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{

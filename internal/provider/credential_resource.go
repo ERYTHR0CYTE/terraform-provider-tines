@@ -122,6 +122,7 @@ func (r *credentialResource) Schema(ctx context.Context, _ resource.SchemaReques
 				WriteOnly: true,
 				Validators: []validator.String{
 					stringvalidator.LengthAtLeast(1),
+					stringvalidator.AlsoRequires(path.MatchRoot("value_wo_version")),
 				},
 			},
 			"value_wo_version": schema.Int64Attribute{
